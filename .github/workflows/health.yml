@@ -1,0 +1,53 @@
+name: External dashboard health
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HEARTBEAT: ${{ vars.PROGRESS_HEARTBEAT }}
+    steps:
+      - name: Validate heartbeat and public dashboard
+        id: test
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,datetime,urllib.request
+          failure=[]
+          try:
+              stamp=datetime.datetime.fromisoformat(os.environ["HEARTBEAT"].replace("Z","+00:00"))
+              age=(datetime.datetime.now(datetime.timezone.utc)-stamp).total_seconds()
+              if age>1500 or age< -120:failure.append("Heartbeat out of range")
+          except Exception:failure.append("Heartbeat absent or invalid")
+          try:
+              req=urllib.request.Request("https://yujisk.github.io/npo-ai-progress-public/",headers={"User-Agent":"ExternalDashboardHealth"})
+              with urllib.request.urlopen(req,timeout=20) as r:
+                  if r.status!=200 or "NPO・AI 開発進捗" not in r.read(500000).decode("utf-8","replace"):
+                      failure.append("Unexpected published content")
+          except Exception:failure.append("Public dashboard unreachable")
+          print("Result:",failure or "OK")
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+              f.write("healthy="+("false" if failure else "true")+"\n")
+          PY
+      - name: Create issue on failure
+        if: steps.test.outputs.healthy == 'false'
+        run: |
+          OPEN="$(gh issue list -R "$REPO" --state open --search 'in:title Dashboard health alert' --json number --jq '.[0].number // ""')"
+          if [ -z "$OPEN" ]; then
+            gh issue create -R "$REPO" --title 'Dashboard health alert' --body "External freshness or HTTP check failed. Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+          exit 1
+      - name: Close alert on recovery
+        if: steps.test.outputs.healthy == 'true'
+        run: |
+          gh issue list -R "$REPO" --state open --search 'in:title Dashboard health alert' --json number --jq '.[].number' |
+          while read -r id; do
+            [ -n "$id" ] && gh issue close "$id" -R "$REPO" --comment 'External check recovered.'
+          done
